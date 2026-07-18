@@ -18,13 +18,15 @@ for tool in "$CC_BIN" "$AR_BIN" mkdir install ln tee grep sort date tclsh make; 
     command -v "$tool" >/dev/null 2>&1 || { echo "Не найдена обязательная команда: $tool" >&2; exit 127; }
 done
 
+# Патчим configure, чтобы отключить жесткую проверку teseq (используется только для docs)
+sed -i 's|as_fn_error.*teseq is required.*|:|' "$ROOT_DIR/configure"
+
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR" "$LOG_DIR"
 : > "$LOG_DIR/configure.log"
 : > "$LOG_DIR/build.log"
 : > "$LOG_DIR/install.log"
 
-# Массив макросов (добавлен JSON, убраны лишние OS_UNIX и FTS4)
 DEFS=(
 -DSQLITE_THREADSAFE=1
 -DSQLITE_SECURE_DELETE=1
@@ -40,9 +42,8 @@ DEFS=(
 -DSQLITE_MAX_VARIABLE_NUMBER=250000
 )
 
-read -r -a USER_CFLAGS <<< "${CFLAGS:--O2 -fPIC}"
-read -r -a USER_LDFLAGS <<< "${LDFLAGS:-}"
-LIBS=(-pthread -ldl -lm)
+# ПЕРЕНЕСЕНО СЮДА: Смена директории ДО создания subshell для логов
+cd "$BUILD_DIR"
 
 {
 echo "Дата: $(date -Iseconds)"
@@ -53,10 +54,8 @@ echo "config.guess: $($ROOT_DIR/config.guess 2>&1 || true)"
 echo "SCHEMA_RETRY: $SCHEMA_RETRY"
 echo
 
-cd "$BUILD_DIR"
-
-# Убран --enable-dynamic-extensions
-TCLSH_CMD=: TCLLIBDIR="$PREFIX/lib/sqlite3" CC="$CC_BIN" CPPFLAGS="${DEFS[*]}" \
+# УБРАНО TCLSH_CMD=:, чтобы configure сам нашел tclsh8.6 и сгенерировал sqlite3.c
+CC="$CC_BIN" CPPFLAGS="${DEFS[*]}" CFLAGS="-O2 -fPIC" \
 "$ROOT_DIR/configure" \
 --prefix="$PREFIX" \
 --disable-tcl \
@@ -68,19 +67,16 @@ TCLSH_CMD=: TCLLIBDIR="$PREFIX/lib/sqlite3" CC="$CC_BIN" CPPFLAGS="${DEFS[*]}" \
 --enable-json
 } 2>&1 | tee "$LOG_DIR/configure.log"
 
-# Стандартная сборка через make (сам сгенерирует amalgamation и соберет бинарники)
 {
 set -x
 make -j"$(nproc)"
 set +x
 } 2>&1 | tee "$LOG_DIR/build.log"
 
-# Установка
 {
 set -x
 make install
 
-# Генерация pkg-config файла
 mkdir -p "$PREFIX/lib/pkgconfig"
 cat > "$PREFIX/lib/pkgconfig/sqlite3.pc" <<EOF
 prefix=$PREFIX
@@ -97,10 +93,8 @@ EOF
 set +x
 } 2>&1 | tee "$LOG_DIR/install.log"
 
-# Проверка опций компиляции
 "$PREFIX/bin/sqlite3" ':memory:' 'PRAGMA compile_options;' | sort > "$LOG_DIR/compile_options.txt"
 
-# Создание тестовой БД и SQL-скрипта для проверки функций
 rm -f "$BUILD_DIR/feature-tests.db"
 cat > "$BUILD_DIR/feature_tests.sql" <<'EOF'
 PRAGMA secure_delete=ON;
@@ -124,18 +118,14 @@ SELECT 'dbstat|1' FROM dbstat LIMIT 1;
 SELECT 'json|1' WHERE json_extract('{"a":1}', '$.a') = 1;
 
 SELECT 'threadsafe|1' FROM pragma_compile_options WHERE option='THREADSAFE=1';
-
 SELECT 'column_metadata|1' FROM pragma_compile_options WHERE option='ENABLE_COLUMN_METADATA';
-
 SELECT 'fts3_tokenizer|1' FROM pragma_compile_options WHERE option='ENABLE_FTS3_TOKENIZER';
 
 SELECT 'schema_retry|' || (CASE WHEN value='__SCHEMA_RETRY__' THEN '1' ELSE '0' END) FROM pragma_compile_options WHERE option='MAX_SCHEMA_RETRY=__SCHEMA_RETRY__';
-
 SELECT 'max_variable|1' FROM pragma_compile_options WHERE option='MAX_VARIABLE_NUMBER=250000';
 EOF
 
 sed -i "s/__SCHEMA_RETRY__/$SCHEMA_RETRY/g" "$BUILD_DIR/feature_tests.sql"
-
 "$PREFIX/bin/sqlite3" "$BUILD_DIR/feature-tests.db" < "$BUILD_DIR/feature_tests.sql" > "$LOG_DIR/feature_tests.txt"
 
 if command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
