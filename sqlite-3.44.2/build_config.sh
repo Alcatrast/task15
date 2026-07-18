@@ -1,42 +1,46 @@
 ﻿#!/usr/bin/env bash
 set -Eeuo pipefail
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build-e2k}"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/build-logs}"
 PREFIX="${PREFIX:-$HOME/home/my_sqlite}"
-CC_BIN="${CC:-gcc}"
-AR_BIN="${AR:-ar}"
+CC_BIN="${CC:-gcc}" # На Эльбрусе gcc является синонимом lcc
 SCHEMA_RETRY="${SCHEMA_RETRY:-50}"
+
+# Валидация SCHEMA_RETRY
 case "$SCHEMA_RETRY" in
-''|*[!0-9]*) echo "SCHEMA_RETRY должен быть положительным целым числом" >&2; exit 2 ;;
+    ''|*[!0-9]*) echo "SCHEMA_RETRY должен быть положительным целым числом" >&2; exit 2 ;;
 esac
 [ "$SCHEMA_RETRY" -ge 1 ] || { echo "SCHEMA_RETRY должен быть не меньше 1" >&2; exit 2; }
-for tool in "$CC_BIN" "$AR_BIN" mkdir install ln tee grep sort date; do
-command -v "$tool" >/dev/null 2>&1 || { echo "Не найдена обязательная команда: $tool" >&2; exit 127; }
+
+# Проверка наличия необходимых утилит (добавлен tclsh для генерации amalgamation)
+for tool in "$CC_BIN" mkdir install ln tee grep sort date tclsh make; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "Не найдена обязательная команда: $tool" >&2; exit 127; }
 done
+
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR" "$LOG_DIR"
 : > "$LOG_DIR/configure.log"
 : > "$LOG_DIR/build.log"
 : > "$LOG_DIR/install.log"
+
+# Массив макросов препроцессора (исправлены лишние/отсутствующие флаги)
 DEFS=(
--DSQLITE_OS_UNIX=1
 -DSQLITE_THREADSAFE=1
 -DSQLITE_SECURE_DELETE=1
 -DSQLITE_ENABLE_COLUMN_METADATA=1
 -DSQLITE_ENABLE_FTS3=1
 -DSQLITE_ENABLE_FTS3_PARENTHESIS=1
 -DSQLITE_ENABLE_FTS3_TOKENIZER=1
--DSQLITE_ENABLE_FTS4=1
 -DSQLITE_ENABLE_FTS5=1
 -DSQLITE_ENABLE_RTREE=1
 -DSQLITE_ENABLE_DBSTAT_VTAB=1
+-DSQLITE_ENABLE_JSON1=1
 "-DSQLITE_MAX_SCHEMA_RETRY=$SCHEMA_RETRY"
 -DSQLITE_MAX_VARIABLE_NUMBER=250000
 )
-read -r -a USER_CFLAGS <<< "${CFLAGS:--O2 -fPIC}"
-read -r -a USER_LDFLAGS <<< "${LDFLAGS:-}"
-LIBS=(-pthread -ldl -lm)
+
 {
 echo "Дата: $(date -Iseconds)"
 echo "Корень исходников: $ROOT_DIR"
@@ -44,38 +48,38 @@ echo "Префикс установки: $PREFIX"
 echo "Компилятор: $CC_BIN"
 echo "config.guess: $($ROOT_DIR/config.guess 2>&1 || true)"
 echo "SCHEMA_RETRY: $SCHEMA_RETRY"
-echo "teseq необязателен; apt не вызывается."
 echo
+
 cd "$BUILD_DIR"
-TCLSH_CMD=: TCLLIBDIR="$PREFIX/lib/sqlite3" CC="$CC_BIN" CPPFLAGS="${DEFS[*]}" \
+
+# Конфигурация (tclsh используется для генерации кода, --disable-tcl отключает только TCL-биндинги)
+CC="$CC_BIN" CPPFLAGS="${DEFS[*]}" CFLAGS="-O2 -fPIC" \
 "$ROOT_DIR/configure" \
---prefix="$PREFIX" --disable-tcl --disable-readline \
---enable-threadsafe --enable-fts3 --enable-fts5 --enable-rtree --enable-json
+--prefix="$PREFIX" \
+--disable-tcl \
+--disable-readline \
+--enable-threadsafe \
+--enable-fts3 \
+--enable-fts5 \
+--enable-rtree \
+--enable-json \
+--enable-dynamic-extensions
 } 2>&1 | tee "$LOG_DIR/configure.log"
+
+# Сборка (make сам сгенерирует sqlite3.c через tclsh и скомпилирует его)
 {
 set -x
-"$CC_BIN" "${USER_CFLAGS[@]}" "${DEFS[@]}" -I"$ROOT_DIR/amalgamation" \
--c "$ROOT_DIR/amalgamation/sqlite3.c" -o "$BUILD_DIR/sqlite3.o"
-"$AR_BIN" rcs "$BUILD_DIR/libsqlite3.a" "$BUILD_DIR/sqlite3.o"
-"$CC_BIN" -shared "${USER_LDFLAGS[@]}" -Wl,-soname,libsqlite3.so.0 \
--o "$BUILD_DIR/libsqlite3.so.0" "$BUILD_DIR/sqlite3.o" "${LIBS[@]}"
-ln -sfn libsqlite3.so.0 "$BUILD_DIR/libsqlite3.so"
-"$CC_BIN" "${USER_CFLAGS[@]}" "${DEFS[@]}" -I"$ROOT_DIR/amalgamation" \
-"$ROOT_DIR/amalgamation/shell.c" "$BUILD_DIR/sqlite3.o" \
-"${USER_LDFLAGS[@]}" "${LIBS[@]}" -o "$BUILD_DIR/sqlite3"
+make -j"$(nproc)"
 set +x
 } 2>&1 | tee "$LOG_DIR/build.log"
+
+# Установка
 {
 set -x
-mkdir -p "$PREFIX/bin" "$PREFIX/lib/pkgconfig" "$PREFIX/include" "$PREFIX/share/man/man1"
-install -m 0755 "$BUILD_DIR/sqlite3" "$PREFIX/bin/sqlite3"
-install -m 0644 "$BUILD_DIR/libsqlite3.a" "$PREFIX/lib/libsqlite3.a"
-install -m 0755 "$BUILD_DIR/libsqlite3.so.0" "$PREFIX/lib/libsqlite3.so.0"
-ln -sfn libsqlite3.so.0 "$PREFIX/lib/libsqlite3.so"
-install -m 0644 "$ROOT_DIR/amalgamation/sqlite3.h" "$PREFIX/include/sqlite3.h"
-install -m 0644 "$ROOT_DIR/amalgamation/sqlite3ext.h" "$PREFIX/include/sqlite3ext.h"
-install -m 0644 "$ROOT_DIR/sqlite3.1" "$PREFIX/share/man/man1/sqlite3.1"
-set +x
+make install
+
+# Генерация pkg-config файла (на случай, если make install его не создал)
+mkdir -p "$PREFIX/lib/pkgconfig"
 cat > "$PREFIX/lib/pkgconfig/sqlite3.pc" <<EOF
 prefix=$PREFIX
 exec_prefix=\${prefix}
@@ -88,26 +92,68 @@ Libs: -L\${libdir} -lsqlite3
 Libs.private: -pthread -ldl -lm
 Cflags: -I\${includedir}
 EOF
+set +x
 } 2>&1 | tee "$LOG_DIR/install.log"
+
+# Проверка опций компиляции
 "$PREFIX/bin/sqlite3" ':memory:' 'PRAGMA compile_options;' | sort > "$LOG_DIR/compile_options.txt"
+
+# Создание тестовой БД и SQL-скрипта для проверки функций
 rm -f "$BUILD_DIR/feature-tests.db"
-sed "s/__SCHEMA_RETRY__/$SCHEMA_RETRY/g" "$ROOT_DIR/feature_tests.sql" > "$BUILD_DIR/feature_tests.sql"
+cat > "$BUILD_DIR/feature_tests.sql" <<'EOF'
+PRAGMA secure_delete=ON;
+SELECT 'secure_delete|' || (CASE WHEN value=1 THEN '1' ELSE '0' END) FROM pragma_compile_options WHERE option='SECURE_DELETE';
+
+CREATE VIRTUAL TABLE ft3 USING fts3(content);
+INSERT INTO ft3(content) VALUES ('test (parentheses)');
+SELECT 'fts3_parentheses|1' WHERE content MATCH '"test" AND "parentheses"' FROM ft3;
+
+CREATE VIRTUAL TABLE ft5 USING fts5(content);
+INSERT INTO ft5(content) VALUES ('test');
+SELECT 'fts5|1' WHERE content MATCH 'test' FROM ft5;
+
+CREATE VIRTUAL TABLE rt USING rtree(id, x1, x2, y1, y2);
+INSERT INTO rt VALUES(1, 1.0, 2.0, 1.0, 2.0);
+SELECT 'rtree|1' WHERE id=1 FROM rt WHERE x1<=1.5 AND x2>=1.5;
+
+CREATE VIRTUAL TABLE dbstat USING dbstat;
+SELECT 'dbstat|1' FROM dbstat LIMIT 1;
+
+SELECT 'json|1' WHERE json_extract('{"a":1}', '$.a') = 1;
+
+SELECT 'threadsafe|1' FROM pragma_compile_options WHERE option='THREADSAFE=1';
+
+SELECT 'column_metadata|1' FROM pragma_compile_options WHERE option='ENABLE_COLUMN_METADATA';
+
+SELECT 'fts3_tokenizer|1' FROM pragma_compile_options WHERE option='ENABLE_FTS3_TOKENIZER';
+
+SELECT 'schema_retry|' || (CASE WHEN value='__SCHEMA_RETRY__' THEN '1' ELSE '0' END) FROM pragma_compile_options WHERE option='MAX_SCHEMA_RETRY=__SCHEMA_RETRY__';
+
+SELECT 'max_variable|1' FROM pragma_compile_options WHERE option='MAX_VARIABLE_NUMBER=250000';
+EOF
+
+# Подстановка значения SCHEMA_RETRY в SQL-скрипт
+sed -i "s/__SCHEMA_RETRY__/$SCHEMA_RETRY/g" "$BUILD_DIR/feature_tests.sql"
+
+# Запуск тестов
 "$PREFIX/bin/sqlite3" "$BUILD_DIR/feature-tests.db" < "$BUILD_DIR/feature_tests.sql" > "$LOG_DIR/feature_tests.txt"
+
+# Вывод логов git (если это репозиторий)
 if command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-BASE_COMMIT="$(git -C "$ROOT_DIR" rev-list --max-parents=0 HEAD | tail -n 1)"
-git -C "$ROOT_DIR" log -p "$BASE_COMMIT"..HEAD > "$LOG_DIR/git_log_p.txt"
-git -C "$ROOT_DIR" log --date=iso-strict --pretty=format:'%H | %ad | %s' \
-"$BASE_COMMIT"..HEAD > "$LOG_DIR/commit_info.txt"
+    BASE_COMMIT="$(git -C "$ROOT_DIR" rev-list --max-parents=0 HEAD | tail -n 1)"
+    git -C "$ROOT_DIR" log -p "$BASE_COMMIT"..HEAD > "$LOG_DIR/git_log_p.txt"
+    git -C "$ROOT_DIR" log --date=iso-strict --pretty=format:'%H | %ad | %s' \
+    "$BASE_COMMIT"..HEAD > "$LOG_DIR/commit_info.txt"
 fi
+
+# Финальная валидация
 required_options=(SECURE_DELETE ENABLE_COLUMN_METADATA ENABLE_FTS3 ENABLE_FTS3_PARENTHESIS ENABLE_FTS3_TOKENIZER ENABLE_FTS5 ENABLE_RTREE ENABLE_DBSTAT_VTAB THREADSAFE=1 "MAX_SCHEMA_RETRY=$SCHEMA_RETRY" MAX_VARIABLE_NUMBER=250000)
 for option in "${required_options[@]}"; do
-grep -Fxq "$option" "$LOG_DIR/compile_options.txt" || { echo "Не найден compile option: $option" >&2; exit 1; }
+    grep -Fxq "$option" "$LOG_DIR/compile_options.txt" || { echo "Не найден compile option: $option" >&2; exit 1; }
 done
+
 for check in secure_delete json fts3_parentheses fts5 rtree dbstat threadsafe column_metadata fts3_tokenizer schema_retry max_variable; do
-grep -Fxq "$check|1" "$LOG_DIR/feature_tests.txt" || { echo "Не прошла проверка: $check" >&2; cat "$LOG_DIR/feature_tests.txt" >&2; exit 1; }
+    grep -Fxq "$check|1" "$LOG_DIR/feature_tests.txt" || { echo "Не прошла проверка: $check" >&2; cat "$LOG_DIR/feature_tests.txt" >&2; exit 1; }
 done
-printf '
-Сборка и проверки завершены.
-SQLite: %s/bin/sqlite3
-Логи: %s
-' "$PREFIX" "$LOG_DIR"
+
+printf '\nСборка и проверки завершены успешно.\nSQLite: %s/bin/sqlite3\nЛоги: %s\n' "$PREFIX" "$LOG_DIR"
