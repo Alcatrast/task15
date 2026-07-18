@@ -5,17 +5,16 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build-e2k}"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/build-logs}"
 PREFIX="${PREFIX:-$HOME/home/my_sqlite}"
-CC_BIN="${CC:-gcc}" # На Эльбрусе gcc является синонимом lcc
+CC_BIN="${CC:-gcc}"
+AR_BIN="${AR:-ar}"
 SCHEMA_RETRY="${SCHEMA_RETRY:-50}"
 
-# Валидация SCHEMA_RETRY
 case "$SCHEMA_RETRY" in
     ''|*[!0-9]*) echo "SCHEMA_RETRY должен быть положительным целым числом" >&2; exit 2 ;;
 esac
 [ "$SCHEMA_RETRY" -ge 1 ] || { echo "SCHEMA_RETRY должен быть не меньше 1" >&2; exit 2; }
 
-# Проверка наличия необходимых утилит (добавлен tclsh для генерации amalgamation)
-for tool in "$CC_BIN" mkdir install ln tee grep sort date tclsh make; do
+for tool in "$CC_BIN" "$AR_BIN" mkdir install ln tee grep sort date tclsh make; do
     command -v "$tool" >/dev/null 2>&1 || { echo "Не найдена обязательная команда: $tool" >&2; exit 127; }
 done
 
@@ -25,7 +24,7 @@ mkdir -p "$BUILD_DIR" "$LOG_DIR"
 : > "$LOG_DIR/build.log"
 : > "$LOG_DIR/install.log"
 
-# Массив макросов препроцессора (исправлены лишние/отсутствующие флаги)
+# Массив макросов (добавлен JSON, убраны лишние OS_UNIX и FTS4)
 DEFS=(
 -DSQLITE_THREADSAFE=1
 -DSQLITE_SECURE_DELETE=1
@@ -41,6 +40,10 @@ DEFS=(
 -DSQLITE_MAX_VARIABLE_NUMBER=250000
 )
 
+read -r -a USER_CFLAGS <<< "${CFLAGS:--O2 -fPIC}"
+read -r -a USER_LDFLAGS <<< "${LDFLAGS:-}"
+LIBS=(-pthread -ldl -lm)
+
 {
 echo "Дата: $(date -Iseconds)"
 echo "Корень исходников: $ROOT_DIR"
@@ -52,8 +55,8 @@ echo
 
 cd "$BUILD_DIR"
 
-# Конфигурация (tclsh используется для генерации кода, --disable-tcl отключает только TCL-биндинги)
-CC="$CC_BIN" CPPFLAGS="${DEFS[*]}" CFLAGS="-O2 -fPIC" \
+# Убран --enable-dynamic-extensions
+TCLSH_CMD=: TCLLIBDIR="$PREFIX/lib/sqlite3" CC="$CC_BIN" CPPFLAGS="${DEFS[*]}" \
 "$ROOT_DIR/configure" \
 --prefix="$PREFIX" \
 --disable-tcl \
@@ -62,11 +65,10 @@ CC="$CC_BIN" CPPFLAGS="${DEFS[*]}" CFLAGS="-O2 -fPIC" \
 --enable-fts3 \
 --enable-fts5 \
 --enable-rtree \
---enable-json \
---enable-dynamic-extensions
+--enable-json
 } 2>&1 | tee "$LOG_DIR/configure.log"
 
-# Сборка (make сам сгенерирует sqlite3.c через tclsh и скомпилирует его)
+# Стандартная сборка через make (сам сгенерирует amalgamation и соберет бинарники)
 {
 set -x
 make -j"$(nproc)"
@@ -78,7 +80,7 @@ set +x
 set -x
 make install
 
-# Генерация pkg-config файла (на случай, если make install его не создал)
+# Генерация pkg-config файла
 mkdir -p "$PREFIX/lib/pkgconfig"
 cat > "$PREFIX/lib/pkgconfig/sqlite3.pc" <<EOF
 prefix=$PREFIX
@@ -132,13 +134,10 @@ SELECT 'schema_retry|' || (CASE WHEN value='__SCHEMA_RETRY__' THEN '1' ELSE '0' 
 SELECT 'max_variable|1' FROM pragma_compile_options WHERE option='MAX_VARIABLE_NUMBER=250000';
 EOF
 
-# Подстановка значения SCHEMA_RETRY в SQL-скрипт
 sed -i "s/__SCHEMA_RETRY__/$SCHEMA_RETRY/g" "$BUILD_DIR/feature_tests.sql"
 
-# Запуск тестов
 "$PREFIX/bin/sqlite3" "$BUILD_DIR/feature-tests.db" < "$BUILD_DIR/feature_tests.sql" > "$LOG_DIR/feature_tests.txt"
 
-# Вывод логов git (если это репозиторий)
 if command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     BASE_COMMIT="$(git -C "$ROOT_DIR" rev-list --max-parents=0 HEAD | tail -n 1)"
     git -C "$ROOT_DIR" log -p "$BASE_COMMIT"..HEAD > "$LOG_DIR/git_log_p.txt"
@@ -146,7 +145,6 @@ if command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" rev-parse --is-inside-wo
     "$BASE_COMMIT"..HEAD > "$LOG_DIR/commit_info.txt"
 fi
 
-# Финальная валидация
 required_options=(SECURE_DELETE ENABLE_COLUMN_METADATA ENABLE_FTS3 ENABLE_FTS3_PARENTHESIS ENABLE_FTS3_TOKENIZER ENABLE_FTS5 ENABLE_RTREE ENABLE_DBSTAT_VTAB THREADSAFE=1 "MAX_SCHEMA_RETRY=$SCHEMA_RETRY" MAX_VARIABLE_NUMBER=250000)
 for option in "${required_options[@]}"; do
     grep -Fxq "$option" "$LOG_DIR/compile_options.txt" || { echo "Не найден compile option: $option" >&2; exit 1; }
