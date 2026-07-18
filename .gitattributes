@@ -1,2 +1,10 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Принудительно использовать LF для скриптов сборки и autotools
+configure text eol=lf
+*.sh text eol=lf
+config.guess text eol=lf
+config.sub text eol=lf
+install-sh text eol=lf
+ltmain.sh text eol=lf
+Makefile.in text eol=lf
+*.c text eol=lf
+*.h text eol=lf
